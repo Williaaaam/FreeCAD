@@ -371,6 +371,54 @@ class TestInvoluteGear(unittest.TestCase):
             msg=f"Total wire length changed after recomputing gear {created_with}",
         )
 
+    def testModuleEditIgnoresEmptyZeroAndRecovers(self):
+        """Clearing the module field must not traceback, and a later value must rebuild.
+
+        The task panel calls Proxy.execute() on every InputField valueChanged.
+        Empty text parses as ~2.2e-308 mm; zero and negative modules are also
+        emitted while the number is being replaced. Those values raise inside
+        the generator. A constructible module, including an intermediate digit
+        such as 2 while typing 20, still rebuilds. A real generator failure
+        (pressure angle 90 deg) must still propagate.
+        """
+        gear = InvoluteGearFeature.makeInvoluteGear("TestGear")
+        self.assertSuccessfulRecompute(gear)
+        self.assertClosedWire(gear.Shape)
+        original_length = gear.Shape.Length
+        original_module = gear.Modules.Value
+
+        # Editor path: do not store the transient, and do not rebuild.
+        empty_sentinel = 2.2250738585072014e-308
+        for transient in (0, -0.0, -1.0, empty_sentinel):
+            applied = InvoluteGearFeature._apply_editor_value(gear, "Modules", transient)
+            self.assertFalse(applied)
+            self.assertAlmostEqual(gear.Modules.Value, original_module)
+            self.assertAlmostEqual(gear.Shape.Length, original_length)
+
+        # Same values already stored (property editor / recompute) must not raise.
+        for bad in (0, -1.0, empty_sentinel):
+            gear.Modules = bad
+            gear.Proxy.execute(gear)
+            self.assertNotIn("Invalid", gear.State)
+            self.assertAlmostEqual(gear.Shape.Length, original_length)
+
+        # Intermediate digit, then the finished module. Length scales with module.
+        for module in (2, 20, 4.5):
+            applied = InvoluteGearFeature._apply_editor_value(gear, "Modules", float(module))
+            self.assertTrue(applied)
+            self.assertSuccessfulRecompute(gear)
+            self.assertClosedWire(gear.Shape)
+        self.assertAlmostEqual(
+            gear.Shape.Length / gear.Modules.Value,
+            original_length / original_module,
+            places=4,
+        )
+
+        gear.Modules = original_module
+        gear.PressureAngle = "90 deg"
+        with self.assertRaises(ValueError):
+            gear.Proxy.execute(gear)
+
     def assertSuccessfulRecompute(self, *objs, msg=None):
         if len(objs) == 0:
             self.Doc.recompute()

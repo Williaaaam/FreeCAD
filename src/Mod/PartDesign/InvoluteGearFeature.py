@@ -21,11 +21,57 @@
 # *                                                                         *
 # ***************************************************************************
 
+import math
 import pathlib
 import FreeCAD, Part
 from PySide import QtCore
 from fcgear import involute
 from fcgear import fcgear
+
+# Millimetres. Cleared Gui::InputField text is a successful parse of
+# numeric_limits<double>::min() (~2.2e-308 mm), not a parse error, and the
+# task panel rebuilds on every valueChanged. That length is positive, so a
+# `module > 0` check does not reject it. The generator then raises:
+# external gears divide by a flushed arc chord (fcgear.midpoints) below
+# ~1e-161 mm, internal gears fail in the fillet solver near 1e-81 mm, and
+# zero or negative modules fail in genInvolutePolar. 1e-9 mm sits above
+# both failure regions and below any practical gear module; values at or
+# above it are passed through unchanged.
+_MIN_CONSTRUCTIBLE_MODULE_MM = 1e-9
+
+
+def _quantity_millimetres(value):
+    """Return a length in millimetres, or None when value is not numeric."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    raw = getattr(value, "Value", None)
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        return None
+    return float(raw)
+
+
+def _module_is_constructible(value):
+    """True when value can be sent to the involute generator.
+
+    Unrecognised types return True so a new editor payload is not dropped
+    on the floor; execute() still sees the stored Quantity.
+    """
+    module = _quantity_millimetres(value)
+    if module is None:
+        return True
+    return math.isfinite(module) and module >= _MIN_CONSTRUCTIBLE_MODULE_MM
+
+
+def _apply_editor_value(obj, property_name, value):
+    """Write one task-panel edit and rebuild. Return False if it was ignored."""
+    if property_name == "Modules" and not _module_is_constructible(value):
+        return False
+    setattr(obj, property_name, value)
+    obj.Proxy.execute(obj)
+    return True
+
 
 if FreeCAD.GuiUp:
     import FreeCADGui
@@ -175,6 +221,15 @@ class _InvoluteGear:
         )
 
     def execute(self, obj):
+        # Direct call from the task-panel slot. Raising here becomes a Report
+        # View traceback, including while the module field is momentarily
+        # empty or zero. Skip the generator for those values and keep the
+        # last profile. Failures for a constructible module still propagate.
+        if not _module_is_constructible(obj.Modules.Value):
+            FreeCAD.Console.PrintWarning(
+                "Involute gear module must be a positive length; keeping the previous shape.\n"
+            )
+            return
         w = fcgear.FCWireBuilder()
         generator_func = (
             involute.CreateExternalGear if obj.ExternalGear else involute.CreateInternalGear
@@ -241,8 +296,8 @@ class _InvoluteGearTaskPanel:
             """Returns a function that takes a single value and assigns it to the given property"""
 
             def assigner(value):
-                setattr(self.obj, property_name, value)
-                self.obj.Proxy.execute(self.obj)
+                if not _apply_editor_value(self.obj, property_name, value):
+                    return
                 if fitView:
                     FreeCAD.Gui.ActiveDocument.ActiveView.sendMessage("ViewFit")
 
